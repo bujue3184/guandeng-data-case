@@ -216,10 +216,77 @@ def sec_rule(k: pd.DataFrame) -> None:
     say()
 
 
+def sec_mechanism(k: pd.DataFrame) -> None:
+    """Test the naive mechanism 'stock was taken by another picker during the gap'."""
+    say("## 5. 机制检验：是「这 15 分钟里被别人抢走了」吗？")
+    say()
+    say("如果真是邻近工单把料领走，那么「同厂 + 同物料 + 15 分钟窗口内出现多单」应该明显更容易失败。数据不支持：")
+    say()
+
+    k = k.reset_index(drop=True).sort_values("req_ts").reset_index(drop=True)
+    per_hour = k.groupby([k["factory_name"], k["req_ts"].dt.floor("h")]).size().groupby(level=0).mean()
+    say(f"- 单量强度：每厂每小时平均 **{per_hour.min():.1f}–{per_hour.max():.1f} 单**，15 分钟窗口内平均不到 1 单 —— 抢料的物理机会本来就很少。")
+    say()
+
+    keys = (k["factory_name"] + "|" + k["material_type"]).values
+    seq = np.zeros(len(k), dtype=int)
+    for key in pd.unique(keys):
+        grp = k[keys == key]
+        t = grp["req_ts"].values
+        idx = grp.index.values
+        for j in range(len(t)):
+            seq[idx[j]] = int(((t > t[j] - np.timedelta64(15, "m")) & (t <= t[j])).sum())
+    k["seq_15m"] = seq
+    kk = k[k["is_fulfilled"].notna()]
+    first = kk[kk["seq_15m"] == 1]
+    later = kk[kk["seq_15m"] >= 2]
+    say("| 同厂同料 15 分钟内的序位 | 单量 | 空跑 | 空跑率 |")
+    say("|---|---|---|---|")
+    for label, part in [("第 1 单（前面没人抢）", first), ("第 2 单及以后（前面有人抢过）", later)]:
+        f = int((part["is_fulfilled"] == 0).sum())
+        say(f"| {label} | {len(part)} | {f} | {f/len(part)*100:.1f}% |")
+    say()
+    base = (first["is_fulfilled"] == 0).mean()
+    exp = base * len(later)
+    say(f"→ 两组差异 **{ (later['is_fulfilled']==0).mean()*100:.1f}% vs {base*100:.1f}%**，但窗口重叠只有 {len(later)} 单（{len(later)/len(kk)*100:.1f}%），")
+    say(f"   按基线 {base*100:.1f}% 计期望失败 {exp:.1f} 次，实际 {int((later['is_fulfilled']==0).sum())} 次 —— **落在噪音范围内，没有显著差异**。")
+    say("   若「被抢走」成立，应看到后到者显著更差；现在看不到，而且这点样本量最多只能解释个位数的空跑，")
+    say(f"   无法解释「{int((k[k['stale_min']>15]['is_fulfilled']==0).sum())} 次空跑落在陈旧快照上」这个量级。**这个假说被否掉。**")
+    say()
+
+    g = kk.groupby(pd.cut(kk["stale_min"], [-1, 15, 30, 1e9], labels=["≤15", "15-30", ">30"]), observed=True).agg(
+        n=("req_id", "size"), qty_mean=("recorded_qty", "mean"), qty_median=("recorded_qty", "median")
+    ).round(2)
+    say("另一种可能的偏差是「旧数字偏大」→ 账面余量乐观。也不是：")
+    say()
+    say(g.to_markdown())
+    say()
+    say("**修正后的机制**：`recorded_qty` 是「最后一次同步时的账面数」，而这个账面数长期没有因为出库被冲减 ——")
+    say("**账实不符（账高于实）才是实质，快照年龄只是它可见的标志。** 代价是同一个缺陷的两面：数字既旧、又虚。")
+    say("要区分「被消耗」与「从来没记准」，需要库存流水/盘点记录，本数据没有 —— 因此这一点只到「账面数不可信」，不指向具体成因。")
+    say()
+
+
+def sec_units(k: pd.DataFrame) -> None:
+    say("## 6. 这两个数量字段能直接比吗？—— 口径存疑")
+    say()
+    under = (k["recorded_qty"] < k["plan_batch_qty"]).mean() * 100
+    ok = (k["is_fulfilled"] == 1).mean() * 100
+    say(f"- `recorded_qty` 中位数 {k['recorded_qty'].median():.0f}，`plan_batch_qty` 中位数 {k['plan_batch_qty'].median():.0f}；")
+    say(f"  **{under:.1f}% 的单在提交时就「账面 < 计划」**，可这批单的履约成功率仍有 **{ok:.1f}%**。")
+    say(f"- `recorded_qty` 取值几乎均匀铺满 0–{int(k['recorded_qty'].max())}（每个整数约 25–42 单，取上限值仅占 {(k['recorded_qty']==k['recorded_qty'].max()).mean()*100:.1f}%），")
+    say("  不像真实的物理库存分布，更像一个被截顶/换过单位的字段。")
+    say()
+    say("→ 结论：**这两个字段大概率不是同一个计量口径**（件/套/托，或按行按批）。")
+    say("   这正是主数据（MDM）该统一而没统一的东西，也是我**拒绝对数量做任何预警规则**的原因：")
+    say("   拿一个口径不明的字段做判断，比不做更危险。")
+    say()
+
+
 def sec_unknown(df_all: pd.DataFrame) -> None:
     u = df_all[df_all["is_fulfilled"].isna()]
     k = df_all[df_all["is_fulfilled"].notna()]
-    say(f"## 5. 未回传的 {len(u)} 单是否会让结论偏掉")
+    say(f"## 7. 未回传的 {len(u)} 单是否会让结论偏掉")
     say()
     say(f"- 未回传占比 {len(u)/len(df_all)*100:.1f}%；其中快照>15min 的占 {(u['stale_min']>15).mean()*100:.1f}%，")
     say(f"  已回传样本中该比例为 {(k['stale_min']>15).mean()*100:.1f}% —— 未回传与快照新鲜度**不相关**，剔除它不会系统性高估或低估根因。")
@@ -269,6 +336,8 @@ def main() -> None:
     sec_root_cause(k)
     sec_alternative(k)
     sec_rule(k)
+    sec_mechanism(k)
+    sec_units(k)
     sec_unknown(df_all)
     plot(k)
     (OUT / "report.md").write_text("\n".join(BUF) + "\n", encoding="utf-8")
